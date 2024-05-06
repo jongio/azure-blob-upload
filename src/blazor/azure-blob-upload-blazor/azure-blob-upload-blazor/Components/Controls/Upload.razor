@@ -1,0 +1,406 @@
+﻿@using Azure.Storage
+@using Microsoft.Extensions.Options
+@using Azure.Storage.Blobs
+@using Azure.Storage.Blobs.Specialized
+@using Azure.Storage.Blobs.Models
+@using System.Net.Http.Headers
+@inject BlobServiceClient blobServiceClient
+@inject IJSRuntime jsRuntime
+@inject IWebHostEnvironment Environment
+@inject IConfiguration Configuration
+@rendermode InteractiveServer
+
+<style>
+    <!-- This style prevents the progress bar from being hidden in the table cell -->
+    .upload-table .progress {
+        height: 3rem;
+    }
+
+    <!-- Style for file icons to match the preview image width -->
+    .file-icon {
+        width: @(PreviewWidth)px;
+        height: auto; /* Maintain aspect ratio */
+    }
+</style>
+
+<script>
+    // We hide the InputFile element to control how the file name is displayed
+    // So we trigger the click event via another button on the page
+    window.triggerClick = (elt) => elt.click();
+</script>
+
+<div>
+    <!-- Hide the InputFile element by default and conditionally add the 'multiple' attribute if MaximumFileCount is > 1 -->
+    <InputFile @ref="inputFile" OnChange="HandleFileUpload" style="display: none;" @attributes="AddUploadAttributes()" />
+
+    <div class="input-group mb-3">
+        <span class="input-group-text"><button class="btn" @onclick="TriggerFileUpload">Upload</button></span>
+        <!--Only show the input control for single file upload mode -->
+        @if (MaximumFileCount == 1)
+        {
+            <input type="text" class="form-control" @bind-value="@SingleUrl" @oninput="@(e => UpdateSingleUrl(e.Value.ToString()))">
+        }
+    </div>
+    <div>
+        @if (!string.IsNullOrEmpty(Error))
+        {
+            <div class="alert alert-danger">@Error</div>
+        }
+    </div>
+    @if (uploadFiles != null && uploadFiles.Any())
+    {
+        <table class="upload-table table table-bordered table-condensed">
+            <tr>
+                <th>Name</th>
+                <th>Last Modified</th>
+                <th>Size</th>
+                <th>Content Type</th>
+                <th>Preview</th>
+                <th>Url</th>
+                <th>State</th>
+            </tr>
+
+            @foreach (UploadFileInfo uploadFile in uploadFiles)
+            {
+                <tr>
+                    <td>@uploadFile.File.Name</td>
+                    <td>@uploadFile.File.LastModified</td>
+                    <td>@uploadFile.File.Size</td>
+                    <td>@uploadFile.File.ContentType</td>
+                    <td>
+                        @{
+                            string fileType = FileHelper.GetFileType(uploadFile.File.Name);
+
+                            switch (fileType)
+                            {
+                                case "image":
+                                    <a href="@uploadFile.Url" target="_blank">
+                                        <img src="@uploadFile.Url" width="@PreviewWidth" />
+                                    </a>
+                                    break;
+                                case "video":
+                                    <i class="bi bi-file-earmark-play-fill file-icon"></i>
+                                    break;
+                                default:
+                                    <i class="bi bi-file-earmark file-icon"></i>
+                                    break;
+                            }
+                        }
+                    </td>
+                    <td>
+                        @if (!string.IsNullOrEmpty(uploadFile.Url))
+                        {
+                            <a href="@uploadFile.Url">Url</a>
+                        }
+                    </td>
+                    <td>
+                        <div>@uploadFile.State.ToString()</div>
+                        @if (uploadFile.State == UploadFileState.Uploading)
+                        {
+                            <div class="progress">
+                                <div class="progress-bar progress-bar-striped progress-bar-animated" role="progressbar" style="width: @(uploadFile.Progress)%;" aria-valuenow="@uploadFile.Progress" aria-valuemin="0" aria-valuemax="100">@(uploadFile.Progress)%</div>
+                            </div>
+                        }
+
+                        @if (!string.IsNullOrEmpty(uploadFile.Error))
+                        {
+                            <div class="alert alert-danger mt-2">
+                                @uploadFile.Error
+                            </div>
+                        }
+                    </td>
+                </tr>
+            }
+        </table>
+    }
+
+</div>
+
+@code {
+
+    /// <summary>
+    /// Adds HTML attributes to a file input element based on the maximum allowable file count.
+    /// </summary>
+    /// <returns>A dictionary of HTML attributes for the file input.</returns>
+    public Dictionary<string, object> AddUploadAttributes()
+    {
+        var dict = new Dictionary<string, object>();
+        if (MaximumFileCount > 1) dict.Add("multiple", true);
+        return dict;
+    }
+
+    /// <summary>
+    /// Represents the different states of a file during the upload process.
+    /// </summary>
+    public enum UploadFileState
+    {
+        Preparing,
+        Uploading,
+        Uploaded,
+        Error
+    }
+
+    /// <summary>
+    /// Contains information about a file being uploaded, including its state and upload progress.
+    /// </summary>
+    public class UploadFileInfo
+    {
+        /// <summary>
+        /// Initializes a new instance of the UploadFileInfo class with the specified browser file.
+        /// </summary>
+        /// <param name="file">The browser file being uploaded.</param>
+        public UploadFileInfo(IBrowserFile file)
+        {
+            File = file;
+        }
+        public IBrowserFile File { get; set; }
+        public string Url { get; set; }
+        public decimal Progress { get; set; } = 0;
+        public string Error { get; set; }
+        public UploadFileState State { get; set; }
+    }
+
+    /// <summary>
+    /// Triggered when the list of uploaded files changes.
+    /// </summary>
+    [Parameter]
+    public EventCallback<List<UploadFileInfo>> OnUploadFilesChanged { get; set; }
+
+    /// <summary>
+    /// Triggered when a single file's URL changes.
+    /// </summary>
+    [Parameter]
+    public EventCallback<string> OnSingleUrlChanged { get; set; }
+
+    /// <summary>
+    /// The default folder path where files will be uploaded. Default value is "default".
+    /// </summary>
+    [Parameter]
+    public string Folder { get; set; } = "default";
+
+    /// <summary>
+    /// The maximum number of files that can be uploaded at once. Default value is 5.
+    /// </summary>
+    [Parameter]
+    public int MaximumFileCount { get; set; } = 5;
+
+    /// <summary>
+    /// The width in pixels used for preview images or icons. Default width is 100 pixels.
+    /// </summary>
+    [Parameter]
+    public int PreviewWidth { get; set; } = 100;
+
+    /// <summary>
+    /// The maximum file size allowed for uploads, specified in bytes. Default is 2 GB (2,147,483,648 bytes).
+    /// </summary>
+    [Parameter]
+    public long MaximumFileSize { get; set; } = 2L * 1024 * 1024 * 1024;
+
+    /// <summary>
+    /// The size of each upload chunk, specified in bytes. Default is 20 MB (20,971,520 bytes).
+    /// </summary>
+    [Parameter]
+    public long UploadChunkSize { get; set; } = 20971520;
+
+    /// <summary>
+    /// The URL of the single uploaded file. Default value is an empty string.
+    /// </summary>
+    [Parameter]
+    public string SingleUrl { get; set; } = "";
+
+    /// <summary>
+    /// The Azure Blob Storage container where files are uploaded. Default value is "uploads".
+    /// </summary>
+    [Parameter]
+    public string BlobContainer { get; set; } = "uploads";
+
+
+    private string Error { get; set; }
+
+    private InputFile? inputFile;
+
+    private List<UploadFileInfo> uploadFiles = new();
+
+    private async Task UpdateSingleUrl(string url)
+    {
+        SingleUrl = url;
+        await OnSingleUrlChanged.InvokeAsync(SingleUrl);
+    }
+
+    private async Task TriggerFileUpload()
+    {
+        await jsRuntime.InvokeAsync<object>("triggerClick", inputFile?.Element);
+    }
+
+    // TODO: Add malware scanning to this https://learn.microsoft.com/en-us/azure/defender-for-cloud/defender-for-storage-malware-scan
+    private async Task HandleFileUpload(InputFileChangeEventArgs e)
+    {
+        Error = string.Empty;
+
+        if (e.FileCount > MaximumFileCount)
+        {
+            // Set the general error message for the control
+            Error = $"You can upload a maximum of {MaximumFileCount} files.";
+            StateHasChanged();
+            return;
+        }
+
+        BlobContainerClient containerClient = null;
+
+        try
+        {
+            containerClient = blobServiceClient.GetBlobContainerClient(BlobContainer);
+            await containerClient.CreateIfNotExistsAsync();
+        }
+        catch (Exception ex)
+        {
+            Error = $"Error connecting to Azure Blob Storage. {ex.Message}";
+            return;
+        }
+
+        // Loop through all files first so we can get them in the uploadFiles collection to be rendered as a table
+        foreach (var file in e.GetMultipleFiles(maximumFileCount: MaximumFileCount))
+        {
+            var uploadFile = new UploadFileInfo(file);
+            uploadFiles.Add(uploadFile);
+            uploadFile.Progress = 0;
+            uploadFile.State = UploadFileState.Preparing;
+        }
+
+        foreach (var uploadFile in uploadFiles)
+        {
+            try
+            {
+                if (uploadFile.File.Size > MaximumFileSize)
+                {
+                    string formattedSizeLimit = FileHelper.FormatFileSize(MaximumFileSize);
+                    uploadFile.Error = $"Error uploading file {uploadFile.File.Name}: File size exceeds the maximum allowed limit of {formattedSizeLimit}.";
+                    continue;
+                }
+
+                uploadFile.State = UploadFileState.Uploading;
+
+                var blobName = $"{Folder}/{uploadFile.File.Name}";
+                var blobClient = containerClient.GetBlockBlobClient(blobName);
+
+                // Create a custom progress handler
+                var progressHandler = new CustomProgressHandler(this, uploadFile);
+
+                StorageTransferOptions transferOptions = new StorageTransferOptions();
+                transferOptions.MaximumConcurrency = 2;
+
+                BlobUploadOptions options = new BlobUploadOptions();
+                options.TransferOptions = transferOptions;
+                options.ProgressHandler = progressHandler;
+
+                options.HttpHeaders = new BlobHttpHeaders
+                    {
+                        ContentType = uploadFile.File.ContentType
+                    };
+
+                try
+                {
+                    await using var fileStream = uploadFile.File.OpenReadStream(maxAllowedSize: MaximumFileSize);
+                    await blobClient.UploadAsync(fileStream, options);
+                    uploadFile.Url = blobClient.Uri.ToString();
+                    if (MaximumFileCount == 1)
+                    {
+                        await UpdateSingleUrl(uploadFile.Url);
+                    }
+
+                    uploadFile.Progress = 100;
+                    uploadFile.State = UploadFileState.Uploaded;
+                }
+                catch (Exception ex)
+                {
+                    uploadFile.Error = $"Error uploading file {uploadFile.File.Name}: {ex.Message}";
+                    uploadFile.State = UploadFileState.Error;
+                }
+
+                await OnUploadFilesChanged.InvokeAsync(uploadFiles);
+                StateHasChanged();
+            }
+            catch (Exception ex)
+            {
+                uploadFile.Error = $"Error uploading file {uploadFile.File.Name}: {ex.Message}";
+                uploadFile.State = UploadFileState.Error;
+                StateHasChanged();
+                continue;
+            }
+        }
+
+        StateHasChanged();
+    }
+
+    // Custom progress handler implementation
+    public class CustomProgressHandler : IProgress<long>
+    {
+        private readonly Upload parent;
+        private readonly UploadFileInfo file;
+
+        public CustomProgressHandler(Upload parentComponent, UploadFileInfo file)
+        {
+            this.parent = parentComponent;
+            this.file = file;
+        }
+
+        public void Report(long value)
+        {
+            // Calculate and update progressPercentage variable in the parent scope
+            decimal progress = (decimal)value / file.File.Size * 100;
+            progress = Math.Round(progress, 1); // Round to one decimal place
+
+
+            // Update UI on the UI thread using InvokeAsync
+            parent.InvokeAsync(() =>
+            {
+                file.Progress = progress;
+                parent.StateHasChanged();
+            });
+        }
+    }
+
+    public static class FileHelper
+    {
+        private static readonly HashSet<string> ImageExtensions = new HashSet<string>(
+            new string[] { ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp" },
+            StringComparer.OrdinalIgnoreCase);
+
+        private static readonly HashSet<string> VideoExtensions = new HashSet<string>(
+            new string[] { ".mp4", ".avi", ".mov", ".wmv" },
+            StringComparer.OrdinalIgnoreCase);
+
+        public static string GetFileType(string url)
+        {
+            string extension = Path.GetExtension(url);
+            if (!string.IsNullOrEmpty(extension))
+            {
+                if (ImageExtensions.Contains(extension))
+                    return "image";
+                if (VideoExtensions.Contains(extension))
+                    return "video";
+            }
+            return "file";
+        }
+
+        public static string FormatFileSize(long size)
+        {
+            if (size < 1024)
+            {
+                return size + " bytes";
+            }
+            else if (size < 1024 * 1024)
+            {
+                return (size / 1024.0).ToString("0.##") + " KB";
+            }
+            else if (size < 1024 * 1024 * 1024)
+            {
+                return (size / (1024.0 * 1024)).ToString("0.##") + " MB";
+            }
+            else
+            {
+                return (size / (1024.0 * 1024 * 1024)).ToString("0.##") + " GB";
+            }
+        }
+    }
+}

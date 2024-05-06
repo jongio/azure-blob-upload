@@ -1,0 +1,8 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Azure/azure-dev/main/schemas/v1.0/azure.yaml.json
+
+name: azure-blob-upload@0.0.1-beta
+services:
+  app:
+    project: src\blazor\azure-blob-upload-blazor\azure-blob-upload-blazor
+    language: csharp
+    host: appservice
