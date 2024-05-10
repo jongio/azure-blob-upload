@@ -191,16 +191,28 @@
     public int PreviewWidth { get; set; } = 100;
 
     /// <summary>
-    /// The maximum file size allowed for uploads, specified in bytes. Default is 2 GB (2,147,483,648 bytes).
+    /// The maximum file size allowed for uploads, specified in bytes. Default is 2 GiB (2,147,483,648 bytes).
     /// </summary>
     [Parameter]
     public long MaximumFileSize { get; set; } = 2L * 1024 * 1024 * 1024;
 
     /// <summary>
-    /// The size of each upload chunk, specified in bytes. Default is 20 MB (20,971,520 bytes).
+    /// Specifies the maximum number of concurrent operations permitted during the transfer process. Default is 2.
     /// </summary>
     [Parameter]
-    public long UploadChunkSize { get; set; } = 20971520;
+    public int MaximumConcurrency { get; set; } = 2;
+
+    /// <summary>
+    /// The size of initial upload chunk, specified in bytes. Default is 4 MiB (4,194,304 bytes).
+    /// </summary>
+    [Parameter]
+    public long InitialTransferSize { get; set; } = 4 * 1024 * 1024;
+
+    /// <summary>
+    /// The maximum size of a transfer chunk, specified in bytes. Default is 4 MiB (4,194,304 bytes).
+    /// </summary>
+    public long MaximumTransferSize { get; set; } = 4 * 1024 * 1024;
+
 
     /// <summary>
     /// The URL of the single uploaded file. Default value is an empty string.
@@ -261,71 +273,86 @@
         // Loop through all files first so we can get them in the uploadFiles collection to be rendered as a table
         foreach (var file in e.GetMultipleFiles(maximumFileCount: MaximumFileCount))
         {
-            var uploadFile = new UploadFileInfo(file);
+            var uploadFile = new UploadFileInfo(file)
+                {
+                    Progress = 0,        // Initialize progress to 0
+                    State = UploadFileState.Preparing  // Set initial state to 'Preparing'
+                };
             uploadFiles.Add(uploadFile);
-            uploadFile.Progress = 0;
-            uploadFile.State = UploadFileState.Preparing;
         }
+
 
         foreach (var uploadFile in uploadFiles)
         {
-            try
+            // The user can repeatedly upload files so we only want to do the upload process if the file hasn't been processed yet. 
+            // We keep a running total in uploadFiles, so all files in the current browser instance appear in the table
+            if (uploadFile.State == UploadFileState.Preparing)
             {
-                if (uploadFile.File.Size > MaximumFileSize)
-                {
-                    string formattedSizeLimit = FileHelper.FormatFileSize(MaximumFileSize);
-                    uploadFile.Error = $"Error uploading file {uploadFile.File.Name}: File size exceeds the maximum allowed limit of {formattedSizeLimit}.";
-                    continue;
-                }
-
-                uploadFile.State = UploadFileState.Uploading;
-
-                var blobName = $"{Folder}/{uploadFile.File.Name}";
-                var blobClient = containerClient.GetBlockBlobClient(blobName);
-
-                // Create a custom progress handler
-                var progressHandler = new CustomProgressHandler(this, uploadFile);
-
-                StorageTransferOptions transferOptions = new StorageTransferOptions();
-                transferOptions.MaximumConcurrency = 2;
-
-                BlobUploadOptions options = new BlobUploadOptions();
-                options.TransferOptions = transferOptions;
-                options.ProgressHandler = progressHandler;
-
-                options.HttpHeaders = new BlobHttpHeaders
-                    {
-                        ContentType = uploadFile.File.ContentType
-                    };
-
                 try
                 {
-                    await using var fileStream = uploadFile.File.OpenReadStream(maxAllowedSize: MaximumFileSize);
-                    await blobClient.UploadAsync(fileStream, options);
-                    uploadFile.Url = blobClient.Uri.ToString();
-                    if (MaximumFileCount == 1)
+                    if (uploadFile.File.Size > MaximumFileSize)
                     {
-                        await UpdateSingleUrl(uploadFile.Url);
+                        string formattedSizeLimit = FileHelper.FormatFileSize(MaximumFileSize);
+                        uploadFile.Error = $"Error uploading file {uploadFile.File.Name}: File size exceeds the maximum allowed limit of {formattedSizeLimit}.";
+                        continue;
                     }
 
-                    uploadFile.Progress = 100;
-                    uploadFile.State = UploadFileState.Uploaded;
+                    uploadFile.State = UploadFileState.Uploading;
+
+                    var blobName = $"{Folder}/{uploadFile.File.Name}";
+                    var blobClient = containerClient.GetBlockBlobClient(blobName);
+
+                    // Create a custom progress handler
+                    var progressHandler = new CustomProgressHandler(this, uploadFile);
+
+                    StorageTransferOptions transferOptions = new StorageTransferOptions
+                        {
+                            MaximumConcurrency = MaximumConcurrency,
+                            InitialTransferSize = InitialTransferSize,
+                            MaximumTransferSize = MaximumTransferSize
+                        };
+
+
+                    BlobUploadOptions options = new BlobUploadOptions
+                        {
+                            TransferOptions = transferOptions,
+                            ProgressHandler = progressHandler,
+                            HttpHeaders = new BlobHttpHeaders
+                            {
+                                ContentType = uploadFile.File.ContentType
+                            }
+                        };
+
+
+                    try
+                    {
+                        await using var fileStream = uploadFile.File.OpenReadStream(maxAllowedSize: MaximumFileSize);
+                        await blobClient.UploadAsync(fileStream, options);
+                        uploadFile.Url = blobClient.Uri.ToString();
+                        if (MaximumFileCount == 1)
+                        {
+                            await UpdateSingleUrl(uploadFile.Url);
+                        }
+
+                        uploadFile.Progress = 100;
+                        uploadFile.State = UploadFileState.Uploaded;
+                    }
+                    catch (Exception ex)
+                    {
+                        uploadFile.Error = $"Error uploading file {uploadFile.File.Name}: {ex.Message}";
+                        uploadFile.State = UploadFileState.Error;
+                    }
+
+                    await OnUploadFilesChanged.InvokeAsync(uploadFiles);
+                    StateHasChanged();
                 }
                 catch (Exception ex)
                 {
                     uploadFile.Error = $"Error uploading file {uploadFile.File.Name}: {ex.Message}";
                     uploadFile.State = UploadFileState.Error;
+                    StateHasChanged();
+                    continue;
                 }
-
-                await OnUploadFilesChanged.InvokeAsync(uploadFiles);
-                StateHasChanged();
-            }
-            catch (Exception ex)
-            {
-                uploadFile.Error = $"Error uploading file {uploadFile.File.Name}: {ex.Message}";
-                uploadFile.State = UploadFileState.Error;
-                StateHasChanged();
-                continue;
             }
         }
 
@@ -349,7 +376,6 @@
             // Calculate and update progressPercentage variable in the parent scope
             decimal progress = (decimal)value / file.File.Size * 100;
             progress = Math.Round(progress, 1); // Round to one decimal place
-
 
             // Update UI on the UI thread using InvokeAsync
             parent.InvokeAsync(() =>
