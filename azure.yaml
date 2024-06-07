@@ -3,6 +3,6 @@
 name: azure-blob-upload@0.0.1-beta
 services:
   app:
-    project: src\blazor\azure-blob-upload-blazor\azure-blob-upload-blazor
+    project: src/blazor/azure-blob-upload-blazor/azure-blob-upload-blazor
     language: csharp
     host: appservice
